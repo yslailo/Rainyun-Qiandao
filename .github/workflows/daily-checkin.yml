@@ -1,106 +1,194 @@
 name: 雨云每日签到
 
 on:
-  # 定时触发 - 每天北京时间 6:45 执行 (UTC 22:45) - 提前避开高峰队列拥堵
+  # ==========================================
+  # 每天北京时间 06:45 执行
+  # GitHub Actions 使用 UTC
+  # 北京时间 06:45 = UTC 22:45（前一天）
+  # ==========================================
   schedule:
     - cron: '45 22 * * *'
-  
-  # 代码推送时触发 (修改此文件时立即运行，用于激活定时器)
+
+  # ==========================================
+  # 修改核心文件时触发
+  # 用于测试 / 激活 Workflow
+  # ==========================================
   push:
     paths:
       - '.github/workflows/daily-checkin.yml'
       - 'rainyun.py'
       - 'requirements.txt'
 
-  # 手动触发（方便测试）
+  # ==========================================
+  # 手动触发
+  # ==========================================
   workflow_dispatch:
     inputs:
       test_username:
         description: '测试账号（留空则使用 Secrets 中的账号）'
         required: false
         default: ''
+
       test_password:
         description: '测试密码（留空则使用 Secrets 中的密码）'
         required: false
         default: ''
 
+# ==========================================
+# GitHub Actions 权限
+#
+# actions: write
+#   用于管理 / 删除 Workflow 运行记录
+#
+# contents: write
+#   用于自动创建 Keepalive commit
+# ==========================================
+permissions:
+  actions: write
+  contents: write
+
 jobs:
   checkin:
     runs-on: ubuntu-latest
+
+    # 设置整个 Job 的时区
     env:
       TZ: Asia/Shanghai
-    
+
     steps:
+
+      # ==========================================
       # 1. 检出代码
+      #
+      # fetch-depth: 0
+      # 保证后面的 git log 能获取完整历史
+      # ==========================================
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # ==========================================
       # 2. 安装中文字体并设置上海时区
-      - name: 安装中文字体并设置上海时区
+      # ==========================================
+      - name: 安装中文字体并设置时区
         run: |
+          echo "当前时间："
+          date
+
           sudo apt-get update
           sudo apt-get install -y fonts-wqy-zenhei tzdata
+
           sudo ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
           echo Asia/Shanghai | sudo tee /etc/timezone > /dev/null
 
-      # 3. 设置 Python 环境
+          echo "设置后的时间："
+          date
+
+      # ==========================================
+      # 3. 设置 Python 3.11
+      # ==========================================
       - name: 设置 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # 4. 安装 Chrome 浏览器
+      # ==========================================
+      # 4. 安装 Chrome
+      # ==========================================
       - name: 安装 Chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
+      # ==========================================
       # 5. 安装 Python 依赖
+      # ==========================================
       - name: 安装依赖
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 6. 缓存 Cookie (避免每日重复登录)
+      # ==========================================
+      # 6. 缓存 Cookie
+      #
+      # 使用固定 key + restore-keys
+      # 让后续运行能够恢复之前的 Cookie
+      # ==========================================
       - name: 缓存 Cookie
         uses: actions/cache@v4
         with:
           path: temp/cookies
-          key: cookies-${{ github.run_id }}
+          key: cookies-${{ runner.os }}-v1
           restore-keys: |
-            cookies-
+            cookies-${{ runner.os }}-
 
-      # 7. 执行签到
+      # ==========================================
+      # 7. 执行雨云签到
+      # ==========================================
       - name: 执行签到
         env:
-          # 从 GitHub Secrets 读取账号密码（手动触发时可由 inputs 覆盖，用于测试）
+
+          # ------------------------------
+          # 雨云账号
+          # 手动触发时可以通过 inputs 覆盖
+          # ------------------------------
           RAINYUN_USERNAME: ${{ github.event.inputs.test_username || secrets.RAINYUN_USERNAME }}
           RAINYUN_PASSWORD: ${{ github.event.inputs.test_password || secrets.RAINYUN_PASSWORD }}
-          # 可选：通知配置
+
+          # ------------------------------
+          # PushPlus
+          # ------------------------------
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+
+          # ------------------------------
+          # WxPusher
+          # ------------------------------
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
           WXPUSHER_UIDS: ${{ secrets.WXPUSHER_UIDS }}
           WXPUSHER_TOPIC_IDS: ${{ secrets.WXPUSHER_TOPIC_IDS }}
+
+          # ------------------------------
+          # 钉钉
+          # ------------------------------
           DINGTALK_ACCESS_TOKEN: ${{ secrets.DINGTALK_ACCESS_TOKEN }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+
+          # ------------------------------
+          # SMTP 邮件
+          # ------------------------------
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
+
+          # ------------------------------
           # 运行配置
-          RUN_MODE: 'once'  # 单次运行模式，执行完就退出
+          # ------------------------------
+          RUN_MODE: 'once'
           DEBUG: 'false'
           MAX_DELAY: '1'
           TIMEOUT: '60000'
           CHECKIN_MAX_RETRIES: '3'
-          # 截图嵌入策略 (all / failed_only / none)
+
+          # ------------------------------
+          # 截图策略
+          # all
+          # failed_only
+          # none
+          # ------------------------------
           SCREENSHOT_MODE: ${{ secrets.SCREENSHOT_MODE || 'failed_only' }}
+
         run: |
           python rainyun.py
 
-      # 8. 上传日志（可选，方便排查问题）
+      # ==========================================
+      # 8. 上传日志
+      #
+      # 无论签到成功还是失败都上传
+      # ==========================================
       - name: 上传日志
         if: always()
         uses: actions/upload-artifact@v4
@@ -108,3 +196,106 @@ jobs:
           name: checkin-logs-${{ github.run_number }}
           path: logs/
           retention-days: 7
+          if-no-files-found: ignore
+
+      # ==========================================
+      # 9. 自动保活
+      #
+      # GitHub 长期没有 commit 可能导致
+      # Scheduled Workflow 被禁用。
+      #
+      # 每次 Workflow 运行时检查：
+      #
+      # < 40 天
+      #     不产生 commit
+      #
+      # >= 40 天
+      #     创建 keepalive commit
+      #
+      # 不使用第三方 Keepalive Action。
+      # ==========================================
+      - name: 保持 GitHub Workflow 活跃
+        if: always()
+        run: |
+
+          echo "=========================================="
+          echo "开始检查仓库活跃状态"
+          echo "=========================================="
+
+          # ------------------------------
+          # 配置 Git 用户
+          # ------------------------------
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # ------------------------------
+          # 获取远程 main
+          # ------------------------------
+          git fetch origin main
+
+          # ------------------------------
+          # 切换到 main
+          # ------------------------------
+          git checkout main
+
+          # ------------------------------
+          # 同步远程最新代码
+          # ------------------------------
+          git reset --hard origin/main
+
+          # ------------------------------
+          # 获取最后一次 commit 时间
+          # ------------------------------
+          LAST_COMMIT=$(git log -1 --format=%ct)
+
+          # 当前 UTC 时间
+          NOW=$(date +%s)
+
+          # 计算距离最后一次 commit 的天数
+          DAYS=$(( (NOW - LAST_COMMIT) / 86400 ))
+
+          echo "最后一次 Commit："
+          git log -1 --format='%h %ci %s'
+
+          echo ""
+          echo "距离最后一次 Commit：${DAYS} 天"
+          echo ""
+
+          # ==========================================
+          # 超过 40 天 → 创建保活 Commit
+          # ==========================================
+          if [ "$DAYS" -ge 40 ]; then
+
+            echo "⚠️ 仓库已经超过 40 天没有 Commit"
+            echo "开始创建 Keepalive Commit..."
+
+            # 创建保活文件
+            mkdir -p .github
+
+            echo "Keepalive: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
+              > .github/keepalive.txt
+
+            # 添加
+            git add .github/keepalive.txt
+
+            # 提交
+            git commit \
+              -m "chore: keep workflow alive [skip ci]"
+
+            # 推送
+            git push origin main
+
+            echo ""
+            echo "✅ Keepalive Commit 创建成功"
+
+          else
+
+            echo "✅ 当前不需要创建 Keepalive Commit"
+            echo "距离 40 天阈值还有 $((40 - DAYS)) 天"
+
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Keepalive 检查完成"
+          echo "=========================================="
