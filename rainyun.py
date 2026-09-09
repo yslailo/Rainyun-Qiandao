@@ -1624,9 +1624,15 @@ def save_screenshot(driver, account_id, status="success", error_msg=""):
         return None
 
 
-def compress_screenshot(input_path, output_path, max_width=800, quality=35):
-    """先本地 Pillow 压缩，如果配置了 TinyPNG 则二次压缩"""
-    result = compress_with_pillow(input_path, output_path, max_width, quality)
+def compress_screenshot(input_path, output_path, max_width=800, quality=None):
+    """先本地 OpenCV 压缩，如果配置了 TinyPNG 则二次压缩"""
+    if quality is None:
+        try:
+            quality = int(os.getenv("SCREENSHOT_QUALITY", "35"))
+        except ValueError:
+            quality = 35
+        quality = max(10, min(100, quality))
+    result = compress_with_cv2(input_path, output_path, max_width, quality)
     if not result:
         return None
     
@@ -1684,24 +1690,79 @@ def compress_with_tinypng(input_path, output_path, api_key):
         return None
 
 
-def compress_with_pillow(input_path, output_path, max_width=1280, quality=40):
-    """使用 Pillow 本地压缩"""
+def _ssim_channel(gray_a, gray_b):
+    import cv2
+
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
+    a = gray_a.astype("float64")
+    b = gray_b.astype("float64")
+    mu_a = cv2.GaussianBlur(a, (7, 7), 1.5)
+    mu_b = cv2.GaussianBlur(b, (7, 7), 1.5)
+    var_a = cv2.GaussianBlur(a * a, (7, 7), 1.5) - mu_a * mu_a
+    var_b = cv2.GaussianBlur(b * b, (7, 7), 1.5) - mu_b * mu_b
+    cov_ab = cv2.GaussianBlur(a * b, (7, 7), 1.5) - mu_a * mu_b
+    ssim_map = ((2 * mu_a * mu_b + C1) * (2 * cov_ab + C2)) / \
+               ((mu_a * mu_a + mu_b * mu_b + C1) * (var_a + var_b + C2))
+    return float(ssim_map.mean())
+
+
+def _ssim(img_a, img_b):
+    """两张彩色图的结构相似度（0~1），取三通道最差值，数值越低画质损失越大"""
+    return min(_ssim_channel(img_a[:, :, c], img_b[:, :, c]) for c in range(3))
+
+
+# 自适应压缩的可读性底线：SSIM 低于此值视为「看不清了」
+SSIM_FLOOR = 0.95
+# 自适应搜索的最低质量档，再低文字笔画会明显崩坏
+MIN_JPEG_QUALITY = 15
+
+
+def compress_with_cv2(input_path, output_path, max_width=1280, quality=40):
+    """OpenCV 压缩截图。quality 为上限：从上限逐档下调，取 SSIM 仍达标的最低档"""
     try:
-        from PIL import Image
-        
-        with Image.open(input_path) as img:
-            if img.mode in ('RGBA', 'P'):
-                img = img.convert('RGB')
-            
-            w, h = img.size
-            if w > max_width:
-                img = img.resize((max_width, int(h * max_width / w)), Image.Resampling.LANCZOS)
-            
-            img.save(output_path, 'JPEG', quality=quality, optimize=True)
-        
+        import cv2
+
+        img = cv2.imread(input_path, cv2.IMREAD_COLOR)
+        if img is None:
+            logger.warning(f"OpenCV 无法读取截图: {input_path}")
+            return None
+
+        h, w = img.shape[:2]
+        if w > max_width:
+            img = cv2.resize(img, (max_width, int(h * max_width / w)), interpolation=cv2.INTER_AREA)
+
+        # 4:4:4：色度不降采样，避免彩色文字边缘串色
+        encode_params = [cv2.IMWRITE_JPEG_OPTIMIZE, 1, cv2.IMWRITE_JPEG_PROGRESSIVE, 1,
+                         cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444]
+
+        chosen_buf = None
+        chosen_q = quality
+        chosen_ssim = 1.0
+        for q in range(quality, MIN_JPEG_QUALITY - 1, -5):
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q] + encode_params)
+            if not ok:
+                continue
+            ssim = _ssim(img, cv2.imdecode(buf, cv2.IMREAD_COLOR))
+            if ssim < SSIM_FLOOR:
+                break
+            chosen_buf, chosen_q, chosen_ssim = buf, q, ssim
+
+        if chosen_buf is None:
+            # 上限档位自己就不达标，尊重上限原样输出
+            ok, chosen_buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality] + encode_params)
+            if not ok:
+                logger.warning(f"OpenCV 无法编码 JPEG: {input_path}")
+                return None
+        elif chosen_q < quality:
+            logger.info(f"自适应压缩: 上限 q{quality} -> q{chosen_q} (SSIM {chosen_ssim:.3f})")
+
+        with open(output_path, "wb") as f:
+            f.write(chosen_buf.tobytes())
+
         return os.path.getsize(output_path)
     except Exception as e:
-        logger.debug(f"Pillow 压缩出错: {e}")
+        logger.warning(f"OpenCV 压缩出错: {e}")
         return None
 
 def cleanup_old_screenshots(screenshot_dir, days=7):
@@ -1936,7 +1997,7 @@ def run_all_accounts():
             
             # 一次性生成 7 份内容，由各 Provider 按自身限制自动选择
             context = {
-                'html_email':        generate_html_report(final_results, screenshot_mode='all'), # 邮件无限制，强制全带截图
+                'html_email':        generate_html_report(final_results, screenshot_mode=screenshot_mode),
                 'html_full':         generate_html_report(final_results, screenshot_mode=screenshot_mode),
                 'html_lite':         generate_html_report(final_results, screenshot_mode='none'),
                 'markdown_full':     generate_markdown_report(final_results, compact=False),
@@ -1979,6 +2040,9 @@ def init_selenium(account_id: str, proxy: str = None):
     ops.add_argument("--disable-plugins")
     # 开启性能日志：页面加载超时时可 dump 网络时间线，定位是 DNS/TTFB/资源下载哪个环节卡住
     ops.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    # 页面加载策略用 eager：DOMContentLoaded 即返回，不等慢子资源挂起卡满超时造成假失败；
+    # 后续流程靠 WebDriverWait 等元素渲染，不依赖 load 事件
+    ops.page_load_strategy = "eager"
     
     # 配置代理
     if proxy:
@@ -2002,16 +2066,14 @@ def init_selenium(account_id: str, proxy: str = None):
         ops.add_argument("--disable-gpu")
 
         # 检测 ChromeDriver 路径
-        # Docker (Selenium镜像) 使用固定路径
-        # GitHub Actions 等环境使用 Selenium Manager 自动管理
+        # 仅 Docker 使用固定路径 /usr/bin/chromedriver；Actions runner 预装的同名文件
+        # 版本与 setup-chrome 装的 Chrome 不一致，故仅 /.dockerenv 存在时才用
         chromedriver_path = "/usr/bin/chromedriver"
-        
-        if os.path.exists(chromedriver_path):
-            # Docker 环境：使用固定路径
+
+        if os.path.exists("/.dockerenv") and os.path.exists(chromedriver_path):
             logger.info(f"使用 Docker 镜像的 ChromeDriver: {chromedriver_path}")
             service = Service(chromedriver_path)
         else:
-            # GitHub Actions 等环境：使用 Selenium Manager 自动管理
             logger.info("使用 Selenium Manager 自动管理 ChromeDriver")
             service = Service()
         
@@ -2068,28 +2130,6 @@ def get_height_from_style(style):
     return re.search(r'height:\s*([\d.]+)px', style).group(1)
 
 
-
-
-# 全局变量，用于存储OCR模型 (单例模式)
-_ocr_model = None
-_det_model = None
-_model_lock = threading.Lock()
-# 推理锁，防止多线程同时调用模型导致内部状态冲突
-_inference_lock = threading.Lock()
-
-def get_shared_ocr_models():
-    """获取全局共享的 OCR 模型实例 (线程安全)"""
-    global _ocr_model, _det_model
-    if _ocr_model is None or _det_model is None:
-        with _model_lock:
-            # 双重检查锁定
-            if _ocr_model is None or _det_model is None:
-                import ddddocr
-                logger.info("正在加载OCR模型...")
-                _ocr_model = ddddocr.DdddOcr(ocr=True, show_ad=False)
-                _det_model = ddddocr.DdddOcr(det=True, show_ad=False)
-    return _ocr_model, _det_model
-
 class CaptchaProvider:
     """验证码提供者基类"""
     def solve(self, driver, timeout, retry_stats, logger_adapter):
@@ -2114,10 +2154,10 @@ class TencentCaptchaProvider(CaptchaProvider):
         By = modules['By']
         ActionChains = modules['ActionChains']
         TimeoutException = modules['TimeoutException']
-        
+
         if retry_stats is None:
             retry_stats = {'count': 0}
-            
+
         try:
             wait = WebDriverWait(driver, min(timeout, 3))
             try:
@@ -2128,194 +2168,39 @@ class TencentCaptchaProvider(CaptchaProvider):
 
             # 延迟导入，只在需要时加载
             import cv2
-            
-            # 使用全局单例模型，避免重复加载导致 OOM
-            ocr, det = get_shared_ocr_models()
-            
+            import ICR
+
             wait = WebDriverWait(driver, timeout)
             self._download_captcha_img(driver, timeout, logger_adapter)
-            
+
             logger_adapter.info("开始处理验证码图片并识别")
-            
-            # 分割待选图块（sprite.jpg）
-            import cv2
-            import numpy as np
-            raw_sprite = cv2.imread("temp/sprite.jpg")
-            if raw_sprite is not None:
-                w_raw = raw_sprite.shape[1]
-                for i in range(3):
-                    temp = raw_sprite[:, w_raw // 3 * i: w_raw // 3 * (i + 1)]
-                    cv2.imwrite(f"temp/sprite_{i + 1}.jpg", temp)
-            
+
             captcha = cv2.imread("temp/captcha.jpg")
-            with open("temp/captcha.jpg", 'rb') as f:
-                captcha_b = f.read()
-            
-            # 目标检测（使用推理锁）
-            with _inference_lock:
-                bboxes = det.detection(captcha_b)
-            
-            # 提取候选框图片和坐标信息
-            spec_infos = []
-            for i in range(len(bboxes)):
-                x1, y1, x2, y2 = bboxes[i]
-                spec = captcha[y1:y2, x1:x2]
-                if not self._is_meaningful_candidate_crop(spec):
-                    logger_adapter.info(f"候选框 {i + 1} 前景过弱，判定为空白/噪声，跳过")
-                    continue
-                spec_path = f"temp/spec_{i + 1}.jpg"
-                cv2.imwrite(spec_path, spec)
-                pos = f"{int((x1 + x2) / 2)},{int((y1 + y2) / 2)}"
-                spec_infos.append({
-                    "path": spec_path,
-                    "pos": pos,
-                    "index": i,
-                    "bbox": (x1, y1, x2, y2),
-                })
-                
-            # --- 阶段 1: 基于目标检测 + OCR/SIFT 的全局分配 ---
-            best_assignment = None
-            best_total_score = -1.0
-            sprite_profiles = []
-            
-            if len(spec_infos) >= 3:
-                import itertools
-                score_matrix = []
-                for j in range(3):
-                    sprite_path = f"temp/sprite_{j + 1}.jpg"
-                    sprite_profile = self._build_sprite_profile(sprite_path, ocr)
-                    sprite_profiles.append(sprite_profile)
-                    sprite_scores = []
-                    for k, spec in enumerate(spec_infos):
-                        score, is_semantic = self._compute_score(
-                            sprite_path,
-                            spec["path"],
-                            ocr,
-                            sprite_profile=sprite_profile,
-                        )
-                        sprite_scores.append(score)
-                        logger_adapter.debug(f"目标 {j + 1} -> 候选 {k + 1}: 得分 {score:.2f} (语义匹配: {is_semantic})")
-                    score_matrix.append(sprite_scores)
-                
-                all_spec_indices = list(range(len(spec_infos)))
-                for perm in itertools.permutations(all_spec_indices, 3):
-                    total_score = score_matrix[0][perm[0]] + score_matrix[1][perm[1]] + score_matrix[2][perm[2]]
-                    if total_score > best_total_score:
-                        best_total_score = total_score
-                        best_assignment = perm
-            
-            MIN_ACCEPTABLE_TOTAL_SCORE = 2.0
+
+            # ICR 纯算法识别：黑色区域分割 + 多角度模板匹配，一次出全部目标坐标
+            matches = ICR.main("temp/captcha.jpg", "temp/sprite.jpg")
             final_click_positions = []
-            use_fallback = False
-            assigned_scores = []
-            
-            if best_assignment is not None and best_total_score >= MIN_ACCEPTABLE_TOTAL_SCORE:
-                assigned_scores = [score_matrix[j][best_assignment[j]] for j in range(3)]
-                min_assigned_score = min(assigned_scores)
-                glyph_low_confidence = False
-                if sprite_profiles:
-                    for j, score in enumerate(assigned_scores):
-                        profile = sprite_profiles[j] if j < len(sprite_profiles) else None
-                        if profile and profile.get("is_glyph") and score < 4.0:
-                            glyph_low_confidence = True
-                            logger_adapter.warning(
-                                f"图案 {j + 1} 被识别为字形，但局部候选最高分仅 {score:.2f}，"
-                                "怀疑正确字符未被候选框截到，降级使用全图搜索..."
-                            )
-                            break
-
-                if min_assigned_score <= 0 or glyph_low_confidence:
-                    logger_adapter.warning(
-                        f"一阶段存在低可信目标（最低单项得分 {min_assigned_score:.2f}），"
-                        "放弃直接提交，降级使用全图边缘模板匹配..."
-                    )
-                    use_fallback = True
-                else:
-                    logger_adapter.info(f"成功找到全局最优组合，验证码一阶段置信分: {best_total_score:.2f}")
-                    for j in range(3):
-                        sprite_path = f"temp/sprite_{j + 1}.jpg"
-                        spec_idx = best_assignment[j]
-                        spec_info = spec_infos[spec_idx]
-                        positon = spec_info["pos"]
-                        score = score_matrix[j][spec_idx]
-                        profile = sprite_profiles[j] if j < len(sprite_profiles) else None
-                        if profile and profile.get("is_glyph"):
-                            logger_adapter.info(
-                                f"--> 图案 {j + 1} 选择候选框 {spec_idx + 1} 位于 ({positon})，"
-                                f"单项得分：{score:.2f}，字形目标使用候选框中心，跳过局部精修"
-                            )
-                        else:
-                            refined_pos, refined_score = self._find_sprite_by_template(
-                                sprite_path,
-                                "temp/captcha.jpg",
-                                search_box=spec_info["bbox"],
-                                padding=12,
-                                target_profile=profile,
-                            )
-                            if refined_pos:
-                                positon = refined_pos
-                                logger_adapter.info(
-                                    f"--> 图案 {j + 1} 选择候选框 {spec_idx + 1}，候选框中心 ({spec_info['pos']}) -> "
-                                    f"局部精修坐标 ({positon})，单项得分：{score:.2f}，精修边缘分：{refined_score:.2f}"
-                                )
-                            else:
-                                logger_adapter.info(
-                                    f"--> 图案 {j + 1} 选择候选框 {spec_idx + 1} 位于 ({positon})，"
-                                    f"单项得分：{score:.2f}，局部精修失败，回退候选框中心"
-                                )
-                        final_click_positions.append(positon)
-            else:
-                score_info = f"{best_total_score:.2f}" if best_assignment is not None else "候选框不足3个"
-                logger_adapter.warning(f"局部目标检测不佳（得分 {score_info} < {MIN_ACCEPTABLE_TOTAL_SCORE}），降级使用全图边缘模板匹配...")
-                use_fallback = True
-                
-            # --- 阶段 2: 全图边缘模板匹配搜索 ---
-            if use_fallback:
-                fallback_candidates = []
-                for j in range(3):
-                    sprite_path = f"temp/sprite_{j + 1}.jpg"
-                    candidates = self._find_template_candidates(
-                        sprite_path,
-                        "temp/captcha.jpg",
-                        top_k=5,
-                        min_distance=24,
-                        target_profile=sprite_profiles[j] if j < len(sprite_profiles) else None,
-                    )
-                    fallback_candidates.append(candidates)
-                    if candidates:
-                        top_candidate = candidates[0]
-                        logger_adapter.info(
-                            f"--> [全图匹配] 图案 {j + 1} 首选坐标 ({top_candidate['pos']})，"
-                            f"候选数：{len(candidates)}，边缘响应分：{top_candidate['score']:.2f}"
-                        )
-                    else:
-                        logger_adapter.info(f"--> [全图匹配] 图案 {j + 1} 未找到候选坐标")
-
-                selected_candidates, fallback_total_score = self._select_best_candidate_combo(
-                    fallback_candidates,
-                    min_distance=24,
+            for match in matches:
+                rect = match['bg_rect']
+                x, y = int(rect[0] + rect[2] / 2), int(rect[1] + rect[3] / 2)
+                logger_adapter.info(
+                    f"--> 图案 {match['sprite_idx'] + 1} 位于 ({x}, {y})，"
+                    f"旋转 {match['angle']}°，相似度 {match['similarity']:.1f}%"
                 )
-                final_click_positions = [candidate["pos"] for candidate in selected_candidates]
-                
-                # Canny 响应度如果在 0.15 以下，说明可能图太花导致边缘都消失
-                MIN_FALLBACK_TOTAL_SCORE = 0.75
-                if fallback_total_score < MIN_FALLBACK_TOTAL_SCORE or len(final_click_positions) < 3:
-                    logger_adapter.error(
-                        f"全图匹配响应度过低 ({fallback_total_score:.2f} < {MIN_FALLBACK_TOTAL_SCORE:.2f})，放弃提交并刷新"
-                    )
-                    self._save_captcha_debug_bundle(
-                        logger_adapter,
-                        stage="fallback_low_score",
-                        retry_count=retry_stats['count'],
-                        extra={
-                            "fallback_total_score": fallback_total_score,
-                            "click_positions": final_click_positions,
-                        },
-                    )
-                    final_click_positions = []  # 触发失败换图逻辑
-            
-            # --- 执行点击动作 ---
-            if len(final_click_positions) == 3:
+                final_click_positions.append(f"{x},{y}")
+
+            if len(final_click_positions) != 3:
+                logger_adapter.error(
+                    f"识别出的目标数为 {len(final_click_positions)}（期望 3 个），放弃提交并刷新"
+                )
+                self._save_captcha_debug_bundle(
+                    logger_adapter,
+                    stage="recognition_count_mismatch",
+                    retry_count=retry_stats['count'],
+                    extra={"click_positions": final_click_positions},
+                )
+                retry_stats['count'] += 1
+            else:
                 for positon in final_click_positions:
                     slideBg = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="slideBg"]')))
                     style = slideBg.get_attribute("style")
@@ -2326,34 +2211,28 @@ class TencentCaptchaProvider(CaptchaProvider):
                     final_x, final_y = int(x_offset + x / width_raw * width), int(y_offset + y / height_raw * height)
                     ActionChains(driver).move_to_element_with_offset(slideBg, final_x, final_y).click().perform()
                     time.sleep(0.3)
-                    
+
                 confirm = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="tcStatus"]/div[2]/div[2]/div/div')))
                 logger_adapter.info("提交验证码")
                 time.sleep(0.5)
                 confirm.click()
                 time.sleep(3)
-                
+
                 # 检查是否通过
                 result_elem = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="tcOperation"]')))
                 if result_elem.get_attribute("class") == 'tc-opera pointer show-success':
                     logger_adapter.info("验证码通过 🎉")
                     return
                 else:
-                    logger_adapter.error(f"验证码提交后未通过，匹配坐标可能存在偏移。")
+                    logger_adapter.error("验证码提交后未通过，匹配坐标可能存在偏移。")
                     self._save_captcha_debug_bundle(
                         logger_adapter,
                         stage="submit_failed",
                         retry_count=retry_stats['count'],
-                        extra={
-                            "click_positions": final_click_positions,
-                            "used_fallback": use_fallback,
-                            "best_total_score": best_total_score,
-                        },
+                        extra={"click_positions": final_click_positions},
                     )
                     retry_stats['count'] += 1
-            else:
-                retry_stats['count'] += 1
-            
+
             # 执行提早换图逻辑
             reload_btn = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="reload"]')))
             time.sleep(1)
@@ -2361,7 +2240,7 @@ class TencentCaptchaProvider(CaptchaProvider):
             time.sleep(3)
             logger_adapter.info(f"重新发起验证码挑战 (当前重试: {retry_stats['count']})")
             return self.solve(driver, timeout, retry_stats, logger_adapter)
-            
+
         except TimeoutException:
             logger_adapter.error("获取验证码图片等元素超时")
         except Exception as e:
@@ -2412,321 +2291,6 @@ class TencentCaptchaProvider(CaptchaProvider):
         logger_adapter.info("开始下载验证码图片(2): " + img2_url)
         download_image(img2_url, "sprite.jpg", user_agent=current_ua)
 
-    def _distance(self, point_a, point_b):
-        import math
-
-        return math.dist(point_a, point_b)
-
-    def _compute_binary_shape_score_images(self, sprite_img, spec_img):
-        """针对数字/简单符号补一层二值形状匹配，避免 SIFT 对低纹理目标直接给 0 分"""
-        import cv2
-        import numpy as np
-
-        if sprite_img is None or spec_img is None:
-            return 0.0
-
-        if len(sprite_img.shape) == 3:
-            sprite_img = cv2.cvtColor(sprite_img, cv2.COLOR_BGR2GRAY)
-        if len(spec_img.shape) == 3:
-            spec_img = cv2.cvtColor(spec_img, cv2.COLOR_BGR2GRAY)
-
-        def normalize_mask(img):
-            blurred = cv2.GaussianBlur(img, (3, 3), 0)
-            _, binary = cv2.threshold(
-                blurred,
-                0,
-                255,
-                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
-            )
-            coords = cv2.findNonZero(binary)
-            if coords is None:
-                return None
-
-            x, y, w, h = cv2.boundingRect(coords)
-            crop = binary[y:y + h, x:x + w]
-            if crop.size == 0:
-                return None
-
-            canvas_size = 64
-            usable_size = canvas_size - 8
-            scale = min(usable_size / max(w, 1), usable_size / max(h, 1))
-            resized_w = max(1, int(round(w * scale)))
-            resized_h = max(1, int(round(h * scale)))
-            resized = cv2.resize(crop, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
-
-            canvas = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
-            offset_x = (canvas_size - resized_w) // 2
-            offset_y = (canvas_size - resized_h) // 2
-            canvas[offset_y:offset_y + resized_h, offset_x:offset_x + resized_w] = resized
-            return canvas
-
-        sprite_mask = normalize_mask(sprite_img)
-        spec_mask = normalize_mask(spec_img)
-        if sprite_mask is None or spec_mask is None:
-            return 0.0
-
-        intersection = np.logical_and(sprite_mask > 0, spec_mask > 0).sum()
-        union = np.logical_or(sprite_mask > 0, spec_mask > 0).sum()
-        iou_score = intersection / union if union else 0.0
-
-        contours_1, _ = cv2.findContours(sprite_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours_2, _ = cv2.findContours(spec_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contour_score = 0.0
-        if contours_1 and contours_2:
-            c1 = max(contours_1, key=cv2.contourArea)
-            c2 = max(contours_2, key=cv2.contourArea)
-            try:
-                shape_distance = cv2.matchShapes(c1, c2, cv2.CONTOURS_MATCH_I1, 0.0)
-                contour_score = 1.0 / (1.0 + shape_distance * 8.0)
-            except Exception:
-                contour_score = 0.0
-
-        return max(iou_score, contour_score, (iou_score + contour_score) / 2.0)
-
-    def _compute_binary_shape_score(self, sprite_path, spec_path):
-        import cv2
-
-        sprite_img = cv2.imread(sprite_path, cv2.IMREAD_GRAYSCALE)
-        spec_img = cv2.imread(spec_path, cv2.IMREAD_GRAYSCALE)
-        return self._compute_binary_shape_score_images(sprite_img, spec_img)
-
-    def _measure_foreground_shape(self, image):
-        import cv2
-
-        if image is None:
-            return {
-                "has_foreground": False,
-                "bbox": (0, 0),
-                "bbox_area": 0,
-                "holes": 0,
-                "dark_ratio": 0.0,
-                "edge_ratio": 0.0,
-                "std": 0.0,
-            }
-
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, binary = cv2.threshold(
-            blurred,
-            0,
-            255,
-            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
-        )
-        coords = cv2.findNonZero(binary)
-        if coords is None:
-            return {
-                "has_foreground": False,
-                "bbox": (0, 0),
-                "bbox_area": 0,
-                "holes": 0,
-                "dark_ratio": float((gray < 180).sum() / gray.size) if gray.size else 0.0,
-                "edge_ratio": 0.0,
-                "std": float(gray.std()) if gray.size else 0.0,
-            }
-
-        x, y, w, h = cv2.boundingRect(coords)
-        bbox_area = w * h
-        contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-        holes = 0
-        if hierarchy is not None:
-            for contour_hierarchy in hierarchy[0]:
-                if contour_hierarchy[3] != -1:
-                    holes += 1
-
-        edges = cv2.Canny(gray, 50, 150)
-        return {
-            "has_foreground": True,
-            "bbox": (w, h),
-            "bbox_area": bbox_area,
-            "holes": holes,
-            "dark_ratio": float((gray < 180).sum() / gray.size) if gray.size else 0.0,
-            "edge_ratio": float((edges > 0).sum() / edges.size) if edges.size else 0.0,
-            "std": float(gray.std()) if gray.size else 0.0,
-        }
-
-    def _is_meaningful_candidate_crop(self, image):
-        metrics = self._measure_foreground_shape(image)
-        if not metrics["has_foreground"]:
-            return False
-
-        if metrics["edge_ratio"] < 0.02 and metrics["std"] < 10 and metrics["dark_ratio"] < 0.02:
-            return False
-
-        return True
-
-    def _normalize_ocr_char(self, text):
-        text = text.strip() if text else ""
-        if len(text) != 1:
-            return ""
-
-        ch = text[0]
-        if ch.isdigit() or ('A' <= ch <= 'Z') or ('a' <= ch <= 'z'):
-            return ch
-        if '\u4e00' <= ch <= '\u9fff':
-            return ch
-        return ""
-
-    def _classify_glyph_char(self, image, ocr):
-        import cv2
-
-        if image is None:
-            return "", {}
-
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, binary = cv2.threshold(
-            blurred,
-            0,
-            255,
-            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
-        )
-        coords = cv2.findNonZero(binary)
-        if coords is not None:
-            x, y, w, h = cv2.boundingRect(coords)
-            padding = 2
-            x = max(0, x - padding)
-            y = max(0, y - padding)
-            w = min(gray.shape[1] - x, w + padding * 2)
-            h = min(gray.shape[0] - y, h + padding * 2)
-            gray = gray[y:y + h, x:x + w]
-            binary = binary[y:y + h, x:x + w]
-
-        variants = {
-            "orig": gray,
-            "th": binary,
-            "inv": 255 - binary,
-            "th_up2": cv2.resize(binary, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST),
-            "inv_up2": cv2.resize(255 - binary, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST),
-        }
-
-        variant_texts = {}
-        try:
-            with _inference_lock:
-                for name, variant in variants.items():
-                    success, encoded = cv2.imencode('.png', variant)
-                    if not success:
-                        variant_texts[name] = ""
-                        continue
-                    variant_texts[name] = (ocr.classification(encoded.tobytes()) or "").strip()
-        except Exception:
-            return "", {}
-
-        orig_char = self._normalize_ocr_char(variant_texts.get("orig"))
-        th_char = self._normalize_ocr_char(variant_texts.get("th"))
-        inv_char = self._normalize_ocr_char(variant_texts.get("inv"))
-        th_up_char = self._normalize_ocr_char(variant_texts.get("th_up2"))
-        inv_up_char = self._normalize_ocr_char(variant_texts.get("inv_up2"))
-
-        if th_char and th_char == inv_char and th_char == th_up_char:
-            return th_char, variant_texts
-        if th_char and th_char == inv_char and th_char == inv_up_char:
-            return th_char, variant_texts
-        if orig_char and th_char and orig_char == th_char:
-            return orig_char, variant_texts
-        if orig_char and inv_char and orig_char == inv_char:
-            return orig_char, variant_texts
-
-        return "", variant_texts
-
-    def _is_likely_glyph_text(self, text):
-        return bool(self._normalize_ocr_char(text))
-
-    def _build_sprite_profile(self, sprite_path, ocr):
-        import cv2
-
-        sprite_text = ""
-        raw_texts = {}
-        foreground_metrics = {}
-        try:
-            sprite_img = cv2.imread(sprite_path)
-            foreground_metrics = self._measure_foreground_shape(sprite_img)
-            sprite_text, raw_texts = self._classify_glyph_char(sprite_img, ocr)
-        except Exception:
-            sprite_text = ""
-            raw_texts = {}
-            foreground_metrics = {}
-
-        bbox_w, bbox_h = foreground_metrics.get("bbox", (0, 0))
-        bbox_area = foreground_metrics.get("bbox_area", 0)
-        holes = foreground_metrics.get("holes", 0)
-        size_likely_glyph = (
-            bbox_w > 0
-            and bbox_h > 0
-            and bbox_w <= 36
-            and bbox_h <= 40
-            and bbox_area <= 1400
-            and holes <= 2
-        )
-        return {
-            "ocr_text": sprite_text,
-            "is_glyph": size_likely_glyph,
-            "raw_ocr": raw_texts,
-            "foreground": foreground_metrics,
-        }
-
-    def _compute_glyph_structure_factor(self, sprite_metrics, spec_metrics):
-        sprite_w, sprite_h = sprite_metrics.get("bbox", (0, 0)) if sprite_metrics else (0, 0)
-        spec_w, spec_h = spec_metrics.get("bbox", (0, 0)) if spec_metrics else (0, 0)
-        if sprite_w <= 0 or sprite_h <= 0 or spec_w <= 0 or spec_h <= 0:
-            return 1.0
-
-        sprite_aspect = sprite_w / max(sprite_h, 1)
-        spec_aspect = spec_w / max(spec_h, 1)
-        aspect_similarity = min(sprite_aspect, spec_aspect) / max(sprite_aspect, spec_aspect)
-
-        hole_gap = abs((sprite_metrics or {}).get("holes", 0) - (spec_metrics or {}).get("holes", 0))
-        if hole_gap == 0:
-            hole_factor = 1.0
-        elif hole_gap == 1:
-            hole_factor = 0.72
-        elif hole_gap == 2:
-            hole_factor = 0.45
-        else:
-            hole_factor = 0.22
-
-        return max(0.22, hole_factor * (0.7 + 0.3 * aspect_similarity))
-
-    def _extract_binary_mask(self, image, crop_foreground=False, padding=2):
-        import cv2
-        import numpy as np
-
-        if image is None:
-            return None
-
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
-
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, binary = cv2.threshold(
-            blurred,
-            0,
-            255,
-            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
-        )
-
-        if crop_foreground:
-            coords = cv2.findNonZero(binary)
-            if coords is None:
-                return None
-            x, y, w, h = cv2.boundingRect(coords)
-            x = max(0, x - padding)
-            y = max(0, y - padding)
-            w = min(binary.shape[1] - x, w + padding * 2)
-            h = min(binary.shape[0] - y, h + padding * 2)
-            binary = binary[y:y + h, x:x + w]
-
-        return binary if binary.size > 0 else None
-
     def _make_safe_name(self, raw_name):
         import re
 
@@ -2772,494 +2336,6 @@ class TencentCaptchaProvider(CaptchaProvider):
             json.dump(metadata, f, ensure_ascii=False, indent=2)
 
         logger_adapter.info(f"已保存验证码调试样本到 {bundle_dir}")
-
-    def _dedupe_candidates(self, candidates, min_distance=24, top_k=5):
-        deduped_candidates = []
-        for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
-            if any(
-                self._distance(candidate["coords"], existing["coords"]) < min_distance
-                for existing in deduped_candidates
-            ):
-                continue
-            deduped_candidates.append(candidate)
-            if len(deduped_candidates) >= top_k:
-                break
-        return deduped_candidates
-
-    def _find_glyph_candidates(self, sprite_path, captcha_path, search_box=None, top_k=5, min_distance=24, padding=0):
-        import cv2
-
-        sprite_img = cv2.imread(sprite_path)
-        captcha_img = cv2.imread(captcha_path)
-        if sprite_img is None or captcha_img is None:
-            return []
-
-        sprite_mask = self._extract_binary_mask(sprite_img, crop_foreground=True, padding=2)
-        if sprite_mask is None:
-            return []
-
-        origin_x, origin_y = 0, 0
-        if search_box is not None:
-            x1, y1, x2, y2 = search_box
-            x1 = max(0, x1 - padding)
-            y1 = max(0, y1 - padding)
-            x2 = min(captcha_img.shape[1], x2 + padding)
-            y2 = min(captcha_img.shape[0], y2 + padding)
-            captcha_view = captcha_img[y1:y2, x1:x2]
-            origin_x, origin_y = x1, y1
-        else:
-            captcha_view = captcha_img
-
-        captcha_mask = self._extract_binary_mask(captcha_view, crop_foreground=False, padding=0)
-        if captcha_mask is None:
-            return []
-
-        if (
-            captcha_mask.shape[0] < sprite_mask.shape[0]
-            or captcha_mask.shape[1] < sprite_mask.shape[1]
-        ):
-            return []
-
-        candidates = []
-        h_s, w_s = sprite_mask.shape
-        for angle in [-12, 0, 12]:
-            if angle != 0:
-                matrix = cv2.getRotationMatrix2D((w_s // 2, h_s // 2), angle, 1.0)
-                rotated_mask = cv2.warpAffine(
-                    sprite_mask,
-                    matrix,
-                    (w_s, h_s),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=0,
-                )
-            else:
-                rotated_mask = sprite_mask
-
-            if (
-                captcha_mask.shape[0] < rotated_mask.shape[0]
-                or captcha_mask.shape[1] < rotated_mask.shape[1]
-            ):
-                continue
-
-            res = cv2.matchTemplate(captcha_mask, rotated_mask, cv2.TM_CCOEFF_NORMED)
-            res_work = res.copy()
-            for _ in range(top_k):
-                _, max_val, _, max_loc = cv2.minMaxLoc(res_work)
-                if max_val <= 0:
-                    break
-
-                center_x = origin_x + max_loc[0] + rotated_mask.shape[1] // 2
-                center_y = origin_y + max_loc[1] + rotated_mask.shape[0] // 2
-                candidates.append({
-                    "pos": f"{center_x},{center_y}",
-                    "coords": (center_x, center_y),
-                    "score": float(max_val),
-                    "angle": angle,
-                })
-
-                left = max(0, max_loc[0] - min_distance)
-                top = max(0, max_loc[1] - min_distance)
-                right = min(res_work.shape[1], max_loc[0] + rotated_mask.shape[1] + min_distance)
-                bottom = min(res_work.shape[0], max_loc[1] + rotated_mask.shape[0] + min_distance)
-                res_work[top:bottom, left:right] = -1.0
-
-        return self._dedupe_candidates(candidates, min_distance=min_distance, top_k=top_k)
-
-    def _find_component_candidates(self, sprite_path, captcha_path, search_box=None, top_k=5, min_distance=24, padding=0, target_profile=None):
-        import cv2
-
-        ocr, _ = get_shared_ocr_models()
-        sprite_img = cv2.imread(sprite_path)
-        captcha_img = cv2.imread(captcha_path)
-        if sprite_img is None or captcha_img is None:
-            return []
-
-        gray_sprite = cv2.cvtColor(sprite_img, cv2.COLOR_BGR2GRAY)
-        _, sprite_binary = cv2.threshold(gray_sprite, 240, 255, cv2.THRESH_BINARY_INV)
-        sprite_coords = cv2.findNonZero(sprite_binary)
-        if sprite_coords is not None:
-            _, _, sprite_w, sprite_h = cv2.boundingRect(sprite_coords)
-        else:
-            sprite_h, sprite_w = sprite_img.shape[:2]
-
-        sprite_foreground = (target_profile or {}).get("foreground", {})
-        if target_profile and target_profile.get("is_glyph"):
-            sprite_w, sprite_h = sprite_foreground.get("bbox", (sprite_w, sprite_h))
-            bbox_area = max(1, sprite_foreground.get("bbox_area", sprite_w * sprite_h))
-            min_bbox_area = max(180, int(bbox_area * 0.18))
-            max_bbox_area = max(min_bbox_area + 1, int(bbox_area * 6.0))
-            crop_padding = 4 if search_box is None else 2
-            thresholds = [24, 32, 40, 48, 60, 72, 96]
-        else:
-            bbox_area = max(1, sprite_w * sprite_h)
-            min_bbox_area = max(180, int(bbox_area * 0.2))
-            max_bbox_area = max(min_bbox_area + 1, int(bbox_area * 6.0))
-            crop_padding = 4 if search_box is None else 2
-            thresholds = [96]
-
-        origin_x, origin_y = 0, 0
-        if search_box is not None:
-            x1, y1, x2, y2 = search_box
-            x1 = max(0, x1 - padding)
-            y1 = max(0, y1 - padding)
-            x2 = min(captcha_img.shape[1], x2 + padding)
-            y2 = min(captcha_img.shape[0], y2 + padding)
-            captcha_view = captcha_img[y1:y2, x1:x2]
-            origin_x, origin_y = x1, y1
-        else:
-            captcha_view = captcha_img
-
-        if captcha_view.size == 0:
-            return []
-
-        gray_view = cv2.cvtColor(captcha_view, cv2.COLOR_BGR2GRAY)
-
-        candidates = []
-        for threshold in thresholds:
-            _, dark_mask = cv2.threshold(gray_view, threshold, 255, cv2.THRESH_BINARY_INV)
-            dark_mask = cv2.medianBlur(dark_mask, 3)
-
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_mask, 8)
-            for i in range(1, num_labels):
-                x, y, w, h, area = stats[i]
-                current_bbox_area = w * h
-                if area < 80 or w < 18 or h < 18:
-                    continue
-                if current_bbox_area < min_bbox_area or current_bbox_area > max_bbox_area:
-                    continue
-
-                left = max(0, x - crop_padding)
-                top = max(0, y - crop_padding)
-                right = min(captcha_view.shape[1], x + w + crop_padding)
-                bottom = min(captcha_view.shape[0], y + h + crop_padding)
-                component_crop = captcha_view[top:bottom, left:right]
-                if component_crop.size == 0:
-                    continue
-
-                score, is_semantic = self._compute_score_from_images(
-                    sprite_img,
-                    component_crop,
-                    ocr,
-                    sprite_profile=target_profile,
-                )
-                if score <= 0:
-                    continue
-
-                component_metrics = self._measure_foreground_shape(component_crop)
-                compare_w, compare_h = component_metrics.get("bbox", (w, h))
-                compare_area = max(1, component_metrics.get("bbox_area", current_bbox_area))
-                width_similarity = min(compare_w, sprite_w) / max(compare_w, sprite_w)
-                height_similarity = min(compare_h, sprite_h) / max(compare_h, sprite_h)
-                area_similarity = min(compare_area, bbox_area) / max(compare_area, bbox_area)
-                if not is_semantic:
-                    if target_profile and target_profile.get("is_glyph"):
-                        size_factor = max(
-                            0.65,
-                            0.4 * ((width_similarity + height_similarity) / 2.0)
-                            + 0.6 * (area_similarity ** 0.25),
-                        )
-                    else:
-                        size_factor = max(0.35, 0.6 * ((width_similarity + height_similarity) / 2.0) + 0.4 * area_similarity)
-                    score *= size_factor
-
-                center_x = origin_x + x + w // 2
-                center_y = origin_y + y + h // 2
-                candidates.append({
-                    "pos": f"{center_x},{center_y}",
-                    "coords": (center_x, center_y),
-                    "score": float(score),
-                    "source": "component",
-                    "semantic": is_semantic,
-                })
-
-        return self._dedupe_candidates(candidates, min_distance=min_distance, top_k=top_k)
-
-    def _find_edge_template_candidates(self, sprite_path, captcha_path, search_box=None, top_k=5, min_distance=24, padding=0):
-        import cv2
-        import numpy as np
-        
-        sprite_img = cv2.imread(sprite_path)
-        captcha_img = cv2.imread(captcha_path)
-        if sprite_img is None or captcha_img is None:
-            return []
-            
-        # 1. 动态过滤白底（提取真实图标部分）
-        gray_sprite = cv2.cvtColor(sprite_img, cv2.COLOR_BGR2GRAY)
-        # 腾讯图块白底通常很亮，提取非白色的前景部分
-        _, binary = cv2.threshold(gray_sprite, 240, 255, cv2.THRESH_BINARY_INV)
-        coords = cv2.findNonZero(binary)
-        if coords is not None:
-            x, y, w, h = cv2.boundingRect(coords)
-            x = max(0, x - 2)
-            y = max(0, y - 2)
-            w = min(sprite_img.shape[1] - x, w + 4)
-            h = min(sprite_img.shape[0] - y, h + 4)
-            sprite_icon = sprite_img[y:y+h, x:x+w]
-        else:
-            sprite_icon = sprite_img
-            
-        sprite_gray = cv2.cvtColor(sprite_icon, cv2.COLOR_BGR2GRAY)
-
-        origin_x, origin_y = 0, 0
-        if search_box is not None:
-            x1, y1, x2, y2 = search_box
-            x1 = max(0, x1 - padding)
-            y1 = max(0, y1 - padding)
-            x2 = min(captcha_img.shape[1], x2 + padding)
-            y2 = min(captcha_img.shape[0], y2 + padding)
-            captcha_view = captcha_img[y1:y2, x1:x2]
-            origin_x, origin_y = x1, y1
-        else:
-            captcha_view = captcha_img
-
-        if captcha_view.size == 0:
-            return []
-
-        captcha_gray = cv2.cvtColor(captcha_view, cv2.COLOR_BGR2GRAY)
-        
-        # 2. 提取 Canny 轮廓
-        sprite_canny = cv2.Canny(sprite_gray, 50, 150)
-        captcha_canny = cv2.Canny(captcha_gray, 50, 150)
-
-        if (
-            captcha_canny.shape[0] < sprite_canny.shape[0]
-            or captcha_canny.shape[1] < sprite_canny.shape[1]
-        ):
-            return []
-
-        h_s, w_s = sprite_canny.shape
-        candidates = []
-        
-        # 3. 施加多重微弱旋转抵御歪斜
-        for angle in [-15, 0, 15]:
-            if angle != 0:
-                M = cv2.getRotationMatrix2D((w_s//2, h_s//2), angle, 1.0)
-                rotated_canny = cv2.warpAffine(sprite_canny, M, (w_s, h_s), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            else:
-                rotated_canny = sprite_canny
-
-            if (
-                captcha_canny.shape[0] < rotated_canny.shape[0]
-                or captcha_canny.shape[1] < rotated_canny.shape[1]
-            ):
-                continue
-
-            res = cv2.matchTemplate(captcha_canny, rotated_canny, cv2.TM_CCOEFF_NORMED)
-            res_work = res.copy()
-
-            for _ in range(top_k):
-                _, max_val, _, max_loc = cv2.minMaxLoc(res_work)
-                if max_val <= 0:
-                    break
-
-                center_x = origin_x + max_loc[0] + rotated_canny.shape[1] // 2
-                center_y = origin_y + max_loc[1] + rotated_canny.shape[0] // 2
-                candidates.append({
-                    "pos": f"{center_x},{center_y}",
-                    "coords": (center_x, center_y),
-                    "score": float(max_val),
-                    "angle": angle,
-                })
-
-                left = max(0, max_loc[0] - min_distance)
-                top = max(0, max_loc[1] - min_distance)
-                right = min(res_work.shape[1], max_loc[0] + rotated_canny.shape[1] + min_distance)
-                bottom = min(res_work.shape[0], max_loc[1] + rotated_canny.shape[0] + min_distance)
-                res_work[top:bottom, left:right] = -1.0
-
-        return self._dedupe_candidates(candidates, min_distance=min_distance, top_k=top_k)
-
-    def _find_template_candidates(self, sprite_path, captcha_path, search_box=None, top_k=5, min_distance=24, padding=0, target_profile=None):
-        """返回模板匹配候选点，用于局部精修和全图降级搜索"""
-        candidates = self._find_component_candidates(
-            sprite_path,
-            captcha_path,
-            search_box=search_box,
-            top_k=top_k,
-            min_distance=min_distance,
-            padding=padding,
-            target_profile=target_profile,
-        )
-
-        if target_profile and target_profile.get("is_glyph"):
-            candidates.extend(
-                self._find_glyph_candidates(
-                    sprite_path,
-                    captcha_path,
-                    search_box=search_box,
-                    top_k=top_k,
-                    min_distance=min_distance,
-                    padding=padding,
-                )
-            )
-        else:
-            candidates.extend(
-                self._find_edge_template_candidates(
-                    sprite_path,
-                    captcha_path,
-                    search_box=search_box,
-                    top_k=top_k,
-                    min_distance=min_distance,
-                    padding=padding,
-                )
-            )
-
-        return self._dedupe_candidates(candidates, min_distance=min_distance, top_k=top_k)
-
-    def _find_sprite_by_template(self, sprite_path, captcha_path, search_box=None, padding=0, target_profile=None):
-        """当目标检测由于背景干扰失败时，采用 Canny 边缘及多角度模板匹配进行搜索"""
-        candidates = self._find_template_candidates(
-            sprite_path,
-            captcha_path,
-            search_box=search_box,
-            top_k=1,
-            min_distance=24,
-            padding=padding,
-            target_profile=target_profile,
-        )
-        if not candidates:
-            return None, 0.0
-        return candidates[0]["pos"], candidates[0]["score"]
-
-    def _select_best_candidate_combo(self, candidate_groups, min_distance=24):
-        import itertools
-
-        if not candidate_groups or any(not candidates for candidates in candidate_groups):
-            return [], 0.0
-
-        best_combo = None
-        best_total_score = -1.0
-
-        for combo in itertools.product(*candidate_groups):
-            coords = [candidate["coords"] for candidate in combo]
-            has_overlap = False
-            for i in range(len(coords)):
-                for j in range(i + 1, len(coords)):
-                    if self._distance(coords[i], coords[j]) < min_distance:
-                        has_overlap = True
-                        break
-                if has_overlap:
-                    break
-            if has_overlap:
-                continue
-
-            total_score = sum(candidate["score"] for candidate in combo)
-            if total_score > best_total_score:
-                best_total_score = total_score
-                best_combo = combo
-
-        if best_combo is None:
-            return [], 0.0
-
-        return list(best_combo), best_total_score
-
-    def _compute_score_from_images(self, sprite_img, spec_img, ocr, sprite_profile=None):
-        """混合评分器：OCR 语义相似度 + SIFT 几何一致性内点评分"""
-        import cv2
-        import numpy as np
-        
-        shape_score = self._compute_binary_shape_score_images(sprite_img, spec_img)
-        sprite_foreground = (sprite_profile or {}).get("foreground", {})
-        spec_foreground = self._measure_foreground_shape(spec_img)
-        sprite_char = ""
-        if sprite_profile:
-            sprite_char = (sprite_profile.get("ocr_text") or "").strip()
-        is_glyph_target = sprite_profile.get("is_glyph", False) if sprite_profile else False
-        spec_char = ""
-        glyph_structure_factor = 1.0
-        if is_glyph_target:
-            glyph_structure_factor = self._compute_glyph_structure_factor(
-                sprite_foreground,
-                spec_foreground,
-            )
-            shape_score *= glyph_structure_factor
-        
-        # 1. OCR 语义比对 (最高优先级，用于解决汉字和数字)
-        try:
-            if not sprite_char:
-                sprite_char, _ = self._classify_glyph_char(sprite_img, ocr)
-                is_glyph_target = bool(sprite_char)
-            if is_glyph_target:
-                spec_char, _ = self._classify_glyph_char(spec_img, ocr)
-            
-            if is_glyph_target:
-                if len(sprite_char) > 0 and len(spec_char) > 0 and sprite_char == spec_char:
-                    threshold = 0.45 if sprite_char in ["0", "1"] else 0.35
-                    if shape_score >= threshold:
-                        return 75.0 + shape_score * 25.0, True
-                    return 60.0 + shape_score * 10.0, True
-                if len(sprite_char) > 0 and len(spec_char) > 0 and sprite_char != spec_char:
-                    return shape_score * 1.5, False
-        except Exception:
-            pass
-
-        # 1.5 字形目标优先依赖形状，不再强行交给 SIFT
-        if is_glyph_target:
-            if shape_score >= 0.75:
-                return shape_score * 28.0, False
-            if shape_score >= 0.55:
-                return shape_score * 16.0, False
-            return shape_score * 4.0, False
-
-        # 非字形目标的纯形状兜底，避免极少特征点时全盘 0 分
-        if shape_score >= 0.55:
-            return shape_score * 20.0, False
-
-        # 2. SIFT + RANSAC 单应性几何校验 (用于解决无规则图形和图标)
-        if sprite_img is None or spec_img is None:
-            return 0.0, False
-
-        img1 = cv2.cvtColor(sprite_img, cv2.COLOR_BGR2GRAY) if len(sprite_img.shape) == 3 else sprite_img
-        img2 = cv2.cvtColor(spec_img, cv2.COLOR_BGR2GRAY) if len(spec_img.shape) == 3 else spec_img
-        
-        if img1 is None or img2 is None:
-            return 0.0, False
-            
-        sift = cv2.SIFT_create(nfeatures=500, contrastThreshold=0.02, edgeThreshold=15)
-        kp1, des1 = sift.detectAndCompute(img1, None)
-        kp2, des2 = sift.detectAndCompute(img2, None)
-        
-        if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
-            return 0.0, False
-            
-        bf = cv2.BFMatcher()
-        matches = bf.knnMatch(des1, des2, k=2)
-        
-        good = []
-        for m_n in matches:
-            if len(m_n) == 2:
-                m, n = m_n
-                if m.distance < 0.8 * n.distance:
-                    good.append(m)
-                    
-        # 当至少有 4 个好匹配点时，才能构成平面几何校验
-        if len(good) >= 4:
-            src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-            dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-            
-            try:
-                # 使用 RANSAC 进行单应性空间一致校验
-                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-                if mask is not None:
-                    inliers = np.sum(mask)
-                    # 每 1 个合规内点计 1 分，满 4 个就能突破提早刷新底线
-                    return float(inliers), False
-            except Exception:
-                pass
-                
-        # 低保得分（如果只有可怜的特征点，且无法构成面）。避免遇到极少特征点的时候全盘 0 分。
-        if len(des1) > 0:
-            return max(len(good) / len(des1), shape_score * 8.0), False
-            
-        return shape_score * 5.0, False
-
-    def _compute_score(self, sprite_path, spec_path, ocr, sprite_profile=None):
-        import cv2
-
-        sprite_img = cv2.imread(sprite_path)
-        spec_img = cv2.imread(spec_path)
-        return self._compute_score_from_images(sprite_img, spec_img, ocr, sprite_profile=sprite_profile)
 
 
 class CaptchaFactory:
@@ -3365,6 +2441,9 @@ def save_cookies(driver, account_id):
 
 def diagnose_page_load_failure(driver, proxy=None):
     """页面加载超时时记录诊断信息，便于区分网络波动/服务端慢/页面资源卡住"""
+    # requests/json 非模块级导入，函数内显式导入，避免诊断流程自身报 NameError 失效
+    import json
+    import requests
     # 浏览器状态：看 driver 卡在哪一步
     try:
         cur_url = driver.current_url or "(空)"
@@ -3419,6 +2498,39 @@ def diagnose_page_load_failure(driver, proxy=None):
         logger.warning(f"[诊断] 无法获取性能日志: {diag_e}")
 
 
+def safe_get(driver, url):
+    """
+    带容错的主文档跳转。
+    page_load_timeout 触发后先 window.stop()，再检查页面实际状态：
+    主文档已加载（readyState interactive/complete 且源码长度正常）则继续流程，
+    避免「页面卡住」的假失败；确实没加载出来才原样抛 TimeoutException 走失败处理。
+    :return: True 页面可用（含超时后抢救成功）
+    """
+    modules = import_selenium_modules()
+    TimeoutException = modules['TimeoutException']
+    try:
+        driver.get(url)
+        return True
+    except TimeoutException:
+        logger.warning(f"页面加载超时（{url}），停止加载并检查页面实际状态...")
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
+        time.sleep(1)
+        # 浏览器连查询都响应不了 = 真卡死，此处会抛异常向上传播
+        ready_state = driver.execute_script("return document.readyState") or "unknown"
+        page_len = len(driver.page_source or "")
+        if ready_state in ("interactive", "complete") and page_len > 500:
+            logger.warning(
+                f"超时但主文档已就绪（readyState={ready_state}, {page_len} 字符），"
+                "忽略未完成的慢子资源，继续流程"
+            )
+            return True
+        logger.error(f"超时且页面未加载出来（readyState={ready_state}, 源码仅 {page_len} 字符）")
+        raise
+
+
 def load_cookies(driver, account_id):
     """加载账号 Cookie 到浏览器，返回是否成功加载"""
     import json
@@ -3439,7 +2551,7 @@ def load_cookies(driver, account_id):
             cookies = json.load(f)
             
         # 必须先访问域名才能设置 Cookie
-        driver.get("https://app.rainyun.com/")
+        safe_get(driver, "https://app.rainyun.com/")
         time.sleep(1)
         
         for cookie in cookies:
@@ -3567,7 +2679,7 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None, failed_pr
         try:
             load_cookies(driver, current_user)
             logger_adapter.info("正在跳转积分页...")
-            driver.get("https://app.rainyun.com/account/reward/earn")
+            safe_get(driver, "https://app.rainyun.com/account/reward/earn")
             time.sleep(3)
         except WebDriverException as e:
             error_msg = str(e)
@@ -3693,7 +2805,7 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None, failed_pr
                 if login_outcome == "success":
                     logger_adapter.info("登录成功！")
                     save_cookies(driver, current_user)
-                    driver.get("https://app.rainyun.com/account/reward/earn")
+                    safe_get(driver, "https://app.rainyun.com/account/reward/earn")
                     time.sleep(2)
                 else:
                     # 页面显示了 toast 错误提示 → 账号密码错误，非代理问题
@@ -3735,7 +2847,7 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None, failed_pr
         
         # 确保在积分页
         if "/account/reward/earn" not in driver.current_url:
-            driver.get("https://app.rainyun.com/account/reward/earn")
+            safe_get(driver, "https://app.rainyun.com/account/reward/earn")
 
         driver.implicitly_wait(5)
         time.sleep(1)
@@ -3747,7 +2859,19 @@ def run_checkin(account_user=None, account_pwd=None, reuse_proxy=None, failed_pr
         # 注意：末尾用 span[2] 而非 span[2]/a —— 签到完成后按钮变为"已完成"，
         # 此时 span[2] 下没有 <a> 子元素，带 /a 会抛 NoSuchElementException。
         CHECKIN_BTN_XPATH = '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[2]/div/div/div/div[1]/div//div/div[1]/div[span[1][normalize-space(text())="每日签到"]]/span[2]'
-        earn = driver.find_element(By.XPATH, CHECKIN_BTN_XPATH)
+        # eager 策略下 safe_get 返回较早，任务列表靠 XHR 填充可能滞后；
+        # 等不到就刷新积分页再试一次，仍没有才判失败
+        try:
+            earn = WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.XPATH, CHECKIN_BTN_XPATH))
+            )
+        except TimeoutException:
+            logger_adapter.warning("未找到签到按钮，刷新积分页重试...")
+            safe_get(driver, "https://app.rainyun.com/account/reward/earn")
+            dismiss_modal_confirm(driver, timeout)
+            earn = WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.XPATH, CHECKIN_BTN_XPATH))
+            )
         btn_text = earn.text.strip()
         logger_adapter.info(f"签到按钮文字: [{btn_text}]")
 
